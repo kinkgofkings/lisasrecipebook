@@ -1,12 +1,14 @@
+import { services } from "../shared/brand-config.js";
+
 const SKIP = /logo|icon|map|flag|diagram|portrait|cartoon|qr code|coat of arms|wrapper|package|person|people|butcher|chart|silhouette|cuts of/i;
 
 export async function findCover(title) {
   const words = String(title || "").toLowerCase().split(/[^a-z0-9]+/).filter((word) => word.length > 3);
   if (!words.length) return "";
-  const url = "https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6&gsrlimit=8&prop=imageinfo&iiprop=mime|url&iiurlwidth=960&format=json&gsrsearch="
+  const url = `${services.wikimediaApi}?action=query&generator=search&gsrnamespace=6&gsrlimit=8&prop=imageinfo&iiprop=mime|url&iiurlwidth=960&format=json&gsrsearch=`
     + encodeURIComponent(`${words.slice(0, 4).join(" ")} food`);
   try {
-    const response = await fetch(url, { headers: { "User-Agent": "LisasRecipeBook/1.0 (family cookbook cover photos)" } });
+    const response = await fetch(url, { headers: { "User-Agent": services.userAgent } });
     if (!response.ok) return "";
     const data = await response.json();
     const pages = Object.values(data.query?.pages || {});

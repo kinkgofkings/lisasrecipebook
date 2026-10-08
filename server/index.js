@@ -11,8 +11,14 @@ import { findCover } from "./cover.js";
 import { hashPassword, checkPassword, signToken, readToken, publicUser } from "./auth.js";
 import {
   addSignal, askHost, deskSnapshot, ensureDesk, getCall, listSignals, listThreads,
-  placeCall, readThread, searchBook, sendMessage, setCall, sqliteDesk
+  placeCall, readThread, searchBook, sendMessage, setCall, scopeDesk, sqliteDesk
 } from "./desk.js";
+import {
+  canCustomize, defaultTenantId, hostsFromOverride, isListedHost, normalizeHost,
+  publicManifest, publicSite, recipeVisible, regionFor, resolveSite, sanitizeBrand,
+  sanitizeHost, sanitizeTheme, sessionAllowed, siteForHost, tenantForHost, domainTaken, catalogSites
+} from "../shared/white-label.js";
+import { cashAppEvent, cashAppSignatureValid, publicOrder, squareEvent, squareSignatureValid, startCheckout } from "../shared/payments.js";
 
 const deskDb = sqliteDesk(db);
 await ensureDesk(deskDb);
@@ -23,12 +29,29 @@ const uploadDir = path.join(root, "uploads");
 fs.mkdirSync(uploadDir, { recursive: true });
 seedIfEmpty();
 
+function extraHosts() {
+  try {
+    return db.prepare("SELECT document FROM tenant_overrides").all().flatMap((row) => hostsFromOverride(row.document));
+  } catch {
+    return [];
+  }
+}
+
 function allowOrigin(origin) {
   if (!origin) return true;
   if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) return true;
   if (/^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)*\.pages\.dev$/.test(origin)) return true;
   if (/^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/.test(origin)) return true;
+  try {
+    const host = normalizeHost(new URL(origin).hostname);
+    if (isListedHost(host) || extraHosts().includes(host)) return true;
+  } catch { /* an odd Origin header is simply not allowed */ }
   return false;
+}
+
+function loadOverride(tenantId) {
+  const row = db.prepare("SELECT document FROM tenant_overrides WHERE tenant_id = ?").get(tenantId);
+  return row?.document || "";
 }
 
 app.use(cors({
@@ -36,12 +59,63 @@ app.use(cors({
     callback(null, allowOrigin(origin));
   }
 }));
+app.post("/api/payments/webhook/:portal", express.raw({ type: "*/*", limit: "1mb" }), async (req, res) => {
+  try {
+    const portal = req.params.portal;
+    const body = Buffer.isBuffer(req.body) ? req.body.toString("utf8") : String(req.body || "");
+    const url = `${req.protocol}://${req.get("host")}${req.originalUrl}`;
+    if (portal === "square") {
+      const ok = await squareSignatureValid({
+        key: process.env.SQUARE_WEBHOOK_SIGNATURE_KEY || "",
+        url,
+        body,
+        signature: req.get("x-square-hmacsha256-signature") || ""
+      });
+      if (!ok) return res.status(401).json({ error: "That notice could not be verified." });
+      const event = squareEvent(JSON.parse(body || "{}"));
+      if (!event.externalId || !event.status) return res.json({ ok: true });
+      db.prepare("UPDATE orders SET status = ? WHERE external_id = ? AND status != 'paid'").run(event.status, event.externalId);
+      return res.json({ ok: true });
+    }
+    if (portal === "cashapp") {
+      const ok = await cashAppSignatureValid({
+        key: process.env.CASHAPP_WEBHOOK_SECRET || "",
+        body,
+        signature: req.get("x-cookbook-signature") || ""
+      });
+      if (!ok) return res.status(401).json({ error: "That notice could not be verified." });
+      const event = cashAppEvent(JSON.parse(body || "{}"));
+      if (!event.orderId || !event.status) return res.json({ ok: true });
+      db.prepare("UPDATE orders SET status = ? WHERE id = ? AND portal = 'cashapp' AND status != 'paid'").run(event.status, event.orderId);
+      return res.json({ ok: true });
+    }
+    return res.status(404).json({ error: "That payment desk is not in the book." });
+  } catch {
+    return res.status(400).json({ error: "That notice could not be read." });
+  }
+});
+
 app.use(express.json({ limit: "1mb" }));
+app.use(async (req, _res, next) => {
+  try {
+    req.site = await siteForHost(req.hostname, (id) => loadOverride(id));
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
 
 function userFrom(req) {
   const payload = readToken(req.get("authorization") || "");
-  if (!payload) return null;
-  return db.prepare("SELECT * FROM users WHERE id = ?").get(payload.id) || null;
+  if (!payload || !sessionAllowed(payload, req.site.id, defaultTenantId())) return null;
+  const user = db.prepare("SELECT * FROM users WHERE id = ?").get(payload.id) || null;
+  if (!user) return null;
+  if ((user.tenant_id || defaultTenantId()) !== req.site.id) return null;
+  return user;
+}
+
+function bookDesk(req) {
+  return scopeDesk(deskDb, req.site.id);
 }
 
 function requireUser(req, res) {
@@ -110,8 +184,82 @@ function cuisineOf(value) {
   return "texas";
 }
 
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, name: "Lisa's Recipe Book" });
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, name: req.site.brand.name, tenant: req.site.id });
+});
+
+app.get("/api/site", (req, res) => {
+  res.json({ site: publicSite(req.site, { canCustomize: canCustomize(req.site, userFrom(req)), env: process.env }) });
+});
+
+app.patch("/api/site", async (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  if (!canCustomize(req.site, user)) return res.status(403).json({ error: "This book is styled from its configuration." });
+  const host = sanitizeHost(req.body?.domain?.customDomain || "");
+  if (req.body?.domain?.customDomain && !host) return res.status(400).json({ error: "That domain name does not look right." });
+  if (host) {
+    const sites = catalogSites().map((site) => resolveSite(site.hosts[0], loadOverride(site.id)));
+    if (domainTaken(host, req.site.id, sites)) return res.status(409).json({ error: "That domain is already used by another book." });
+  }
+  const document = JSON.stringify({
+    brand: sanitizeBrand(req.body?.brand),
+    theme: sanitizeTheme(req.body?.theme),
+    domain: { customDomain: host, subdomain: String(req.body?.domain?.subdomain || "").trim().toLowerCase() }
+  });
+  db.prepare(`
+    INSERT INTO tenant_overrides (tenant_id, document, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(tenant_id) DO UPDATE SET document = excluded.document, updated_at = excluded.updated_at
+  `).run(req.site.id, document, new Date().toISOString());
+  req.site = await siteForHost(req.hostname, (id) => loadOverride(id));
+  res.json({ site: publicSite(req.site, { canCustomize: true, env: process.env }) });
+});
+
+app.get("/api/location/menu", (req, res) => {
+  const menu = regionFor(req.site, { lat: req.query.lat, lng: req.query.lng });
+  res.json({ menu });
+});
+
+app.get("/manifest.webmanifest", (req, res) => {
+  res.type("application/manifest+json").json(publicManifest(req.site));
+});
+
+app.get("/api/payments/portals", (req, res) => {
+  res.json({ payments: publicSite(req.site, { env: process.env }).payments });
+});
+
+app.get("/api/payments/orders", (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  const rows = db.prepare(`
+    SELECT id, portal, amount_cents AS amountCents, currency, note, status, checkout_url AS checkoutUrl, created_at AS createdAt
+    FROM orders WHERE tenant_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 20
+  `).all(req.site.id, user.id);
+  res.json({ orders: rows.map(publicOrder) });
+});
+
+app.post("/api/payments/checkout", async (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  try {
+    const order = await startCheckout({
+      site: req.site,
+      portal: String(req.body?.portal || ""),
+      amountCents: req.body?.amountCents,
+      note: req.body?.note,
+      user,
+      env: process.env,
+      save(row) {
+        db.prepare(`
+          INSERT INTO orders (id, tenant_id, user_id, portal, amount_cents, currency, note, status, external_id, checkout_url, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(row.id, row.tenantId, row.userId, row.portal, row.amountCents, row.currency, row.note, row.status, row.externalId, row.checkoutUrl, row.createdAt);
+      }
+    });
+    res.status(201).json({ order });
+  } catch (error) {
+    res.status(error.status || 500).json({ error: error.status ? error.message : "The payment desk could not open." });
+  }
 });
 
 app.post("/api/auth/register", (req, res) => {
@@ -123,11 +271,11 @@ app.post("/api/auth/register", (req, res) => {
   if (password.length < 8) return res.status(400).json({ error: "Use a password of at least 8 characters." });
   try {
     const result = db.prepare(`
-      INSERT INTO users (email, password_hash, name, bio, avatar_path, created_at)
-      VALUES (?, ?, ?, '', '', ?)
-    `).run(email, hashPassword(password), name, new Date().toISOString());
+      INSERT INTO users (email, password_hash, name, bio, avatar_path, created_at, tenant_id)
+      VALUES (?, ?, ?, '', '', ?, ?)
+    `).run(email, hashPassword(password), name, new Date().toISOString(), req.site.id);
     const user = db.prepare("SELECT * FROM users WHERE id = ?").get(result.lastInsertRowid);
-    res.status(201).json({ token: signToken(user.id), user: publicUser(user) });
+    res.status(201).json({ token: signToken(user.id, req.site.id), user: publicUser(user) });
   } catch {
     res.status(409).json({ error: "That email already has a profile." });
   }
@@ -136,11 +284,11 @@ app.post("/api/auth/register", (req, res) => {
 app.post("/api/auth/login", (req, res) => {
   const email = String(req.body.email || "").trim().toLowerCase();
   const password = String(req.body.password || "");
-  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
+  const user = db.prepare("SELECT * FROM users WHERE email = ? AND tenant_id = ?").get(email, req.site.id);
   if (!user || !checkPassword(password, user.password_hash)) {
     return res.status(401).json({ error: "That email and password do not match." });
   }
-  res.json({ token: signToken(user.id), user: publicUser(user) });
+  res.json({ token: signToken(user.id, req.site.id), user: publicUser(user) });
 });
 
 app.get("/api/auth/me", (req, res) => {
@@ -233,14 +381,16 @@ app.get("/api/recipes", (req, res) => {
     SELECT * FROM recipes
     WHERE (? = '' OR cuisine = ?)
       AND (? = '' OR title LIKE ? OR summary LIKE ?)
+      AND (tenant_id = '' OR tenant_id = ?)
     ORDER BY family DESC, title COLLATE NOCASE
-  `).all(cuisine, cuisine, q, `%${q}%`, `%${q}%`);
+  `).all(cuisine, cuisine, q, `%${q}%`, `%${q}%`, req.site.id);
   res.json({ recipes: attachSocial(userFrom(req), "recipe", rows.map(recipeRow), (item) => item.id) });
 });
 
 app.get("/api/recipes/:id", (req, res) => {
-  const recipe = recipeRow(db.prepare("SELECT * FROM recipes WHERE id = ?").get(req.params.id));
-  if (!recipe) return res.status(404).json({ error: "That recipe is not in the book." });
+  const row = db.prepare("SELECT * FROM recipes WHERE id = ?").get(req.params.id);
+  if (!row || !recipeVisible(row, req.site.id)) return res.status(404).json({ error: "That recipe is not in the book." });
+  const recipe = recipeRow(row);
   res.json({ recipe });
 });
 
@@ -265,8 +415,8 @@ app.post("/api/recipes", async (req, res) => {
     INSERT INTO recipes (
       id, title, cuisine, category, summary, yield_text, prep_minutes, cook_minutes,
       ingredients, steps, notes, image, image_credit, source_url, source_title, family,
-      created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      created_at, updated_at, tenant_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
   `).run(
     id,
     title,
@@ -284,7 +434,8 @@ app.post("/api/recipes", async (req, res) => {
     String(req.body.sourceUrl || "").slice(0, 500),
     String(req.body.sourceTitle || "").slice(0, 160),
     now,
-    now
+    now,
+    req.site.id
   );
   res.status(201).json({ recipe: recipeRow(db.prepare("SELECT * FROM recipes WHERE id = ?").get(id)) });
 });
@@ -292,7 +443,7 @@ app.post("/api/recipes", async (req, res) => {
 app.patch("/api/recipes/:id", (req, res) => {
   if (!requireUser(req, res)) return;
   const existing = db.prepare("SELECT * FROM recipes WHERE id = ?").get(req.params.id);
-  if (!existing) return res.status(404).json({ error: "That recipe is not in the book." });
+  if (!existing || !recipeVisible(existing, req.site.id)) return res.status(404).json({ error: "That recipe is not in the book." });
   const ingredients = req.body.ingredients != null
     ? (Array.isArray(req.body.ingredients) ? req.body.ingredients : lines(req.body.ingredients))
     : JSON.parse(existing.ingredients);
@@ -329,7 +480,7 @@ app.patch("/api/recipes/:id", (req, res) => {
 app.delete("/api/recipes/:id", (req, res) => {
   if (!requireUser(req, res)) return;
   const existing = db.prepare("SELECT * FROM recipes WHERE id = ?").get(req.params.id);
-  if (!existing) return res.status(404).json({ error: "That recipe is not in the book." });
+  if (!existing || !recipeVisible(existing, req.site.id)) return res.status(404).json({ error: "That recipe is not in the book." });
   removeUpload(existing.image);
   for (const media of db.prepare("SELECT path FROM recipe_media WHERE recipe_id = ?").all(existing.id)) removeUpload(media.path);
   db.prepare("DELETE FROM recipe_media WHERE recipe_id = ?").run(existing.id);
@@ -344,7 +495,7 @@ app.post("/api/recipes/:id/media", (req, res) => {
     if (err) return res.status(400).json({ error: err.message });
     if (!requireUser(req, res)) return;
     const recipe = db.prepare("SELECT * FROM recipes WHERE id = ?").get(req.params.id);
-    if (!recipe) return res.status(404).json({ error: "That recipe is not in the book." });
+    if (!recipe || !recipeVisible(recipe, req.site.id)) return res.status(404).json({ error: "That recipe is not in the book." });
     if (!req.file) return res.status(400).json({ error: "Choose a file first." });
     const stored = `/uploads/${req.file.filename}`;
     if (kind === "image" && req.query.role === "cover") {
@@ -657,7 +808,7 @@ app.post("/api/world/:id/keep", async (req, res) => {
   if (!requireUser(req, res)) return;
   try {
     const recipe = await worldRecipe(req.params.id);
-    const existing = db.prepare("SELECT id FROM recipes WHERE source_url = ?").get(recipe.sourceUrl);
+    const existing = db.prepare("SELECT id FROM recipes WHERE source_url = ? AND (tenant_id = '' OR tenant_id = ?)").get(recipe.sourceUrl, req.site.id);
     if (existing) {
       return res.json({ recipe: recipeRow(db.prepare("SELECT * FROM recipes WHERE id = ?").get(existing.id)) });
     }
@@ -674,8 +825,8 @@ app.post("/api/world/:id/keep", async (req, res) => {
       INSERT INTO recipes (
         id, title, cuisine, category, summary, yield_text, prep_minutes, cook_minutes,
         ingredients, steps, notes, image, image_credit, source_url, source_title, family,
-        created_at, updated_at
-      ) VALUES (?, ?, 'library', ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+        created_at, updated_at, tenant_id
+      ) VALUES (?, ?, 'library', ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
     `).run(
       id,
       recipe.title,
@@ -690,7 +841,8 @@ app.post("/api/world/:id/keep", async (req, res) => {
       recipe.sourceUrl,
       recipe.sourceTitle,
       now,
-      now
+      now,
+      req.site.id
     );
     res.status(201).json({ recipe: recipeRow(db.prepare("SELECT * FROM recipes WHERE id = ?").get(id)) });
   } catch (error) {
@@ -724,60 +876,60 @@ function deskSend(res, work) {
 app.get("/api/desk", (req, res) => {
   const user = deskUser(req, res);
   if (!user) return;
-  deskSend(res, deskSnapshot(deskDb, user.id));
+  deskSend(res, deskSnapshot(bookDesk(req), user.id));
 });
 
 app.get("/api/messages", (req, res) => {
   const user = deskUser(req, res);
   if (!user) return;
-  if (req.query.with) deskSend(res, readThread(deskDb, user.id, req.query.with, req.query.after));
-  else deskSend(res, listThreads(deskDb, user.id));
+  if (req.query.with) deskSend(res, readThread(bookDesk(req), user.id, req.query.with, req.query.after));
+  else deskSend(res, listThreads(bookDesk(req), user.id));
 });
 
 app.post("/api/messages", (req, res) => {
   const user = deskUser(req, res);
   if (!user) return;
-  deskSend(res, sendMessage(deskDb, user.id, req.body || {}).then((message) => ({ message })));
+  deskSend(res, sendMessage(bookDesk(req), user.id, req.body || {}).then((message) => ({ message })));
 });
 
 app.post("/api/calls", (req, res) => {
   const user = deskUser(req, res);
   if (!user) return;
-  deskSend(res, placeCall(deskDb, user.id, req.body || {}));
+  deskSend(res, placeCall(bookDesk(req), user.id, req.body || {}));
 });
 
 app.get("/api/calls/:id/signals", (req, res) => {
   const user = deskUser(req, res);
   if (!user) return;
-  deskSend(res, listSignals(deskDb, user.id, req.params.id, req.query.after));
+  deskSend(res, listSignals(bookDesk(req), user.id, req.params.id, req.query.after));
 });
 
 app.post("/api/calls/:id/signals", (req, res) => {
   const user = deskUser(req, res);
   if (!user) return;
-  deskSend(res, addSignal(deskDb, user.id, req.params.id, req.body?.payload));
+  deskSend(res, addSignal(bookDesk(req), user.id, req.params.id, req.body?.payload));
 });
 
 app.get("/api/calls/:id", (req, res) => {
   const user = deskUser(req, res);
   if (!user) return;
-  deskSend(res, getCall(deskDb, user.id, req.params.id));
+  deskSend(res, getCall(bookDesk(req), user.id, req.params.id));
 });
 
 app.post("/api/calls/:id", (req, res) => {
   const user = deskUser(req, res);
   if (!user) return;
-  deskSend(res, setCall(deskDb, user.id, req.params.id, req.body || {}));
+  deskSend(res, setCall(bookDesk(req), user.id, req.params.id, req.body || {}));
 });
 
 app.get("/api/search", (req, res) => {
   const user = userFrom(req);
-  deskSend(res, searchBook(deskDb, user?.id || null, req.query.q));
+  deskSend(res, searchBook(bookDesk(req), user?.id || null, req.query.q));
 });
 
 app.post("/api/ask", (req, res) => {
   const user = userFrom(req);
-  deskSend(res, askHost(deskDb, user?.id || null, req.body?.question, null));
+  deskSend(res, askHost(bookDesk(req), user?.id || null, req.body?.question, null));
 });
 
 function personSocial(user, id) {
@@ -816,14 +968,14 @@ function personCard(user, row) {
 app.get("/api/people", (req, res) => {
   const user = requireUser(req, res);
   if (!user) return;
-  const people = db.prepare("SELECT id, name, bio, avatar_path FROM users ORDER BY name COLLATE NOCASE").all();
+  const people = db.prepare("SELECT id, name, bio, avatar_path FROM users WHERE tenant_id = ? ORDER BY name COLLATE NOCASE").all(req.site.id);
   res.json({ people: people.map((row) => personCard(user, row)) });
 });
 
 app.get("/api/people/:id", (req, res) => {
   const user = requireUser(req, res);
   if (!user) return;
-  const row = db.prepare("SELECT id, name, bio, avatar_path FROM users WHERE id = ?").get(req.params.id);
+  const row = db.prepare("SELECT id, name, bio, avatar_path FROM users WHERE id = ? AND tenant_id = ?").get(req.params.id, req.site.id);
   if (!row) return res.status(404).json({ error: "That person is not in the book." });
   res.json({ person: personCard(user, row) });
 });
@@ -832,7 +984,7 @@ app.post("/api/people/:id/follow", (req, res) => {
   const user = requireUser(req, res);
   if (!user) return;
   if (String(user.id) === String(req.params.id)) return res.status(400).json({ error: "That is your own account." });
-  const other = db.prepare("SELECT id FROM users WHERE id = ?").get(req.params.id);
+  const other = db.prepare("SELECT id FROM users WHERE id = ? AND tenant_id = ?").get(req.params.id, req.site.id);
   if (!other) return res.status(404).json({ error: "That person is not in the book." });
   const existing = db.prepare("SELECT 1 AS found FROM follows WHERE follower_id = ? AND following_id = ?").get(user.id, req.params.id);
   if (existing) {
@@ -947,5 +1099,5 @@ app.use((err, _req, res, _next) => {
 
 const port = Number(process.env.PORT) || 4173;
 app.listen(port, "0.0.0.0", () => {
-  console.log(`Lisa's Recipe Book is listening on ${port}`);
+  console.log(`${tenantForHost("localhost").brand.name} is listening on ${port}`);
 });

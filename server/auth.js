@@ -21,9 +21,10 @@ export function checkPassword(password, hash) {
   return bcrypt.compareSync(password, hash);
 }
 
-export function signToken(userId) {
+export function signToken(userId, tenantId = "") {
   const body = Buffer.from(JSON.stringify({
     id: userId,
+    tenant: tenantId,
     exp: Date.now() + 1000 * 60 * 60 * 24 * 30
   })).toString("base64url");
   const sig = crypto.createHmac("sha256", secret()).update(body).digest("base64url");

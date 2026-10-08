@@ -19,7 +19,7 @@ self.addEventListener("message", (event) => {
   if (event.data?.type === "timer-clear") {
     clearTimeout(timerHandle);
     timerHandle = null;
-    event.waitUntil(self.registration.getNotifications({ tag: "lisa-timer" }).then((notes) => {
+    event.waitUntil(self.registration.getNotifications({ tag: event.data.tag || "lisa-timer" }).then((notes) => {
       notes.forEach((note) => note.close());
     }));
     return;
@@ -29,9 +29,9 @@ self.addEventListener("message", (event) => {
   const endAt = Number(event.data.endAt) || 0;
   const delay = Math.max(0, endAt - Date.now());
   timerHandle = setTimeout(() => {
-    self.registration.showNotification("Lisa's Recipe Book", {
+    self.registration.showNotification(event.data.title || "Cookbook", {
       body: "The timer is up.",
-      tag: "lisa-timer",
+      tag: event.data.tag || "lisa-timer",
       renotify: true,
       vibrate: [220, 120, 220, 120, 320]
     });

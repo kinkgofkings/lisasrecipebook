@@ -1,6 +1,17 @@
 import { attachCallMedia, bindDesk, callLayer, clearCallSound, deskAction, deskNavigated, deskSubmit, deskTick, linkTools, messagesView, pageLink, paintDeskBadge, previewCallSound, ringerLabel, saveCallSound, searchView, warmRinger } from "./desk.js?v=26";
+import { applySite, bookName as brandName } from "./brand.js?v=1";
 
 const API = window.APP_CONFIG?.apiBase || "";
+function bookName() {
+  return brandName(state.site);
+}
+function storeKey(name) {
+  const id = state.site?.id || window.APP_CONFIG?.site?.id || "lisa";
+  return id === "lisa" ? `lisa-${name}` : `book-${id}-${name}`;
+}
+function mealHost() {
+  return state.site?.services?.mealDbHost || "themealdb.com";
+}
 const state = {
   user: null,
   recipes: [],
@@ -62,7 +73,12 @@ const state = {
   ringerName: "",
   ringingFor: "",
   notePosting: false,
-  reacting: ""
+  reacting: "",
+  site: window.APP_CONFIG?.site || null,
+  place: null,
+  placeFocus: false,
+  orders: [],
+  payNote: ""
 };
 const timer = { endAt: 0, pausedRemaining: 0, running: false, handle: null, alerted: false };
 let deferredInstall = null;
@@ -136,9 +152,9 @@ function guessMime(file, name) {
 
 function mealDbPage(url) {
   try {
-    return /(^|\.)themealdb\.com$/i.test(new URL(url).hostname);
+    return new RegExp(`(^|\\.)${mealHost().replace(/\./g, "\\.")}$`, "i").test(new URL(url).hostname);
   } catch {
-    return /themealdb\.com/i.test(String(url || ""));
+    return new RegExp(mealHost().replace(/\./g, "\\."), "i").test(String(url || ""));
   }
 }
 
@@ -169,7 +185,7 @@ async function uploadPieces(file, name) {
 
 async function api(path, options = {}) {
   const headers = { ...(options.headers || {}) };
-  const token = localStorage.getItem("lisa-token");
+  const token = localStorage.getItem(storeKey("token"));
   if (token) headers.Authorization = `Bearer ${token}`;
   if (options.json) {
     headers["Content-Type"] = "application/json";
@@ -264,8 +280,8 @@ function shell(main) {
       <a class="brand" href="#/">
         <img class="ribbon-mark" src="/ribbon.svg" alt="">
         <span>
-          <p class="eyebrow">For Lisa Miller</p>
-          <h1>Lisa's Recipe Book</h1>
+          <p class="eyebrow">${esc(state.site?.brand?.eyebrow || "")}</p>
+          <h1>${esc(bookName())}</h1>
         </span>
       </a>
     </header>
@@ -296,15 +312,21 @@ function commentSection(type) {
   return "home";
 }
 
+function serviceOn(id) {
+  const list = state.place?.services;
+  if (!list?.length) return true;
+  return list.includes(id);
+}
+
 function appBar() {
-  const menuOn = state.menu || ["family", "profile", "account", "privacy", "terms", "new", "edit", "search", "sound"].includes(route().name);
+  const menuOn = state.menu || ["family", "profile", "account", "privacy", "terms", "new", "edit", "search", "sound", "support", "setup"].includes(route().name);
   const item = (href, icon, label, on) => `<a class="appbar-item ${on ? "active" : ""}" href="${href}" ${on ? 'aria-current="page"' : ""}><i class="bi ${icon}" aria-hidden="true"></i><span>${label}</span></a>`;
   return `<nav class="appbar" aria-label="Sections">
-    ${item("#/", "bi-book", "Book", sectionOn("home"))}
-    ${item("#/library", "bi-collection", "Library", sectionOn("library"))}
-    <a class="appbar-item ${sectionOn("messages") ? "active" : ""}" href="#/messages" ${sectionOn("messages") ? 'aria-current="page"' : ""}><i class="bi bi-chat-dots" aria-hidden="true"></i><span>Messages</span><span class="ping" data-badge="messages" ${(state.unread || state.incoming) ? "" : "hidden"}></span></a>
-    ${item("#/notes", "bi-journal-text", "Notepad", sectionOn("notes"))}
-    ${item("#/studio", "bi-camera-reels", "Studio", sectionOn("studio"))}
+    ${serviceOn("book") ? item("#/", "bi-book", "Book", sectionOn("home")) : ""}
+    ${serviceOn("library") ? item("#/library", "bi-collection", "Library", sectionOn("library")) : ""}
+    ${serviceOn("messages") ? `<a class="appbar-item ${sectionOn("messages") ? "active" : ""}" href="#/messages" ${sectionOn("messages") ? 'aria-current="page"' : ""}><i class="bi bi-chat-dots" aria-hidden="true"></i><span>Messages</span><span class="ping" data-badge="messages" ${(state.unread || state.incoming) ? "" : "hidden"}></span></a>` : ""}
+    ${serviceOn("notes") ? item("#/notes", "bi-journal-text", "Notepad", sectionOn("notes")) : ""}
+    ${serviceOn("studio") ? item("#/studio", "bi-camera-reels", "Studio", sectionOn("studio")) : ""}
     <button class="appbar-item ${menuOn ? "active" : ""}" type="button" data-action="toggle-menu" aria-expanded="${state.menu ? "true" : "false"}" aria-controls="super-menu">
       <i class="bi bi-grid" aria-hidden="true"></i><span>Menu</span>
     </button>
@@ -344,14 +366,16 @@ function superMenu() {
       ${session}
       <p class="menu-label">The book</p>
       <div class="menu-list">
-        ${menuLink("#/", "bi-book", "Book", sectionOn("home"))}
-        ${menuLink("#/messages", "bi-chat-dots", "Messages", sectionOn("messages"))}
-        ${menuLink("#/search", "bi-search", "Search", sectionOn("search"))}
-        ${menuLink("#/library", "bi-collection", "Library", sectionOn("library"))}
-        ${menuLink("#/notes", "bi-journal-text", "Notepad", sectionOn("notes"))}
-        ${menuLink("#/studio", "bi-camera-reels", "Studio", sectionOn("studio"))}
-        ${menuLink("#/family", "bi-people", "Family", sectionOn("family"))}
-        ${menuLink("#/new", "bi-plus-circle", "Write a recipe", sectionOn("write"))}
+        ${serviceOn("book") ? menuLink("#/", "bi-book", "Book", sectionOn("home")) : ""}
+        ${serviceOn("messages") ? menuLink("#/messages", "bi-chat-dots", "Messages", sectionOn("messages")) : ""}
+        ${serviceOn("search") ? menuLink("#/search", "bi-search", "Search", sectionOn("search")) : ""}
+        ${serviceOn("library") ? menuLink("#/library", "bi-collection", "Library", sectionOn("library")) : ""}
+        ${serviceOn("notes") ? menuLink("#/notes", "bi-journal-text", "Notepad", sectionOn("notes")) : ""}
+        ${serviceOn("studio") ? menuLink("#/studio", "bi-camera-reels", "Studio", sectionOn("studio")) : ""}
+        ${serviceOn("family") ? menuLink("#/family", "bi-people", "Family", sectionOn("family")) : ""}
+        ${serviceOn("write") ? menuLink("#/new", "bi-plus-circle", "Write a recipe", sectionOn("write")) : ""}
+        ${state.site?.payments?.enabled ? menuLink("#/support", "bi-wallet2", "Kitchen fund", sectionOn("support")) : ""}
+        ${state.site?.canCustomize ? menuLink("#/setup", "bi-palette", "Book setup", sectionOn("setup")) : ""}
       </div>
       <p class="menu-label">Account</p>
       <div class="menu-list">
@@ -365,6 +389,47 @@ function superMenu() {
         ${menuLink("#/terms", "bi-file-earmark-text", "Terms of use", sectionOn("terms"))}
       </div>
     </section>`;
+}
+
+function supportView() {
+  const portals = state.site?.payments?.portals || [];
+  const choices = portals.map((portal) => `<option value="${esc(portal.id)}" ${portal.ready ? "" : "disabled"}>${esc(portal.label)}${portal.ready ? "" : " (not ready)"}</option>`).join("");
+  const orders = (state.orders || []).map((order) => `<li>${esc(order.note)} · $${(order.amountCents / 100).toFixed(2)} · ${esc(order.status)}${order.checkoutUrl ? ` · <a href="${esc(order.checkoutUrl)}">Open checkout</a>` : ""}</li>`).join("");
+  return shell(`
+    <h2 class="page-title">Kitchen fund</h2>
+    <p>Pay through the desk this book has turned on. Card numbers stay with Square or Cash App. This book only keeps the amount and the link.</p>
+    ${state.user ? `<form class="panel" data-action="pay">
+      <div class="field"><label>Desk<select name="portal">${choices}</select></label></div>
+      <div class="field"><label>Amount in dollars<input name="dollars" inputmode="decimal" value="10" required></label></div>
+      <div class="field"><label>Note<input name="note" maxlength="80" value="Kitchen fund"></label></div>
+      <button class="btn moss" type="submit">Open checkout</button>
+    </form>
+    ${orders ? `<section class="panel"><h3>Your checkouts</h3><ul>${orders}</ul></section>` : ""}` : `<p class="empty">Log in before you open a checkout.</p><a class="btn" href="#/account">Log in</a>`}
+  `);
+}
+
+function setupView() {
+  const brand = state.site?.brand || {};
+  const theme = state.site?.theme || {};
+  const domain = state.site?.domain || {};
+  if (!state.site?.canCustomize) {
+    return shell(`<h2 class="page-title">Book setup</h2><p>This book’s name, colors, and domain are set in its configuration.</p>`);
+  }
+  return shell(`
+    <h2 class="page-title">Book setup</h2>
+    <p>These changes dress this hostname. Another book on another subdomain keeps its own accounts and its own look.</p>
+    <form class="panel" data-action="save-setup">
+      <div class="field"><label>Book name<input name="name" value="${esc(brand.name || "")}" required></label></div>
+      <div class="field"><label>Eyebrow<input name="eyebrow" value="${esc(brand.eyebrow || "")}"></label></div>
+      <div class="field"><label>Whose book<input name="owner" value="${esc(brand.owner || "")}"></label></div>
+      <div class="field"><label>Accent color<input name="moss" type="color" value="${esc(theme.moss || "#2f6f4e")}"></label></div>
+      <div class="field"><label>Paper color<input name="paper" type="color" value="${esc(theme.paper || "#f4f7f2")}"></label></div>
+      <div class="field"><label>Custom domain<input name="customDomain" value="${esc(domain.customDomain || "")}" placeholder="kitchen.example.com"></label></div>
+      <div class="field"><label>Subdomain label<input name="subdomain" value="${esc(domain.subdomain || "")}" placeholder="kitchen"></label></div>
+      <p class="empty">Point the domain at the ${esc(state.site?.services?.pagesProject || "pages")} project, then save the hostname here.</p>
+      <button class="btn moss" type="submit">Save this book</button>
+    </form>
+  `);
 }
 
 function soundView() {
@@ -384,7 +449,7 @@ function soundView() {
     </section>
     <section class="panel">
       <h3>The loud notification</h3>
-      <p>That banner uses the sound set for this app on the phone. On the Razr, open Settings, then Apps, then Lisa's Recipe Book. Open Notifications, then Sound, and choose the tone you want.</p>
+      <p>That banner uses the sound set for this app on the phone. On the Razr, open Settings, then Apps, then ${esc(bookName())}. Open Notifications, then Sound, and choose the tone you want.</p>
       <p>If the book is still open in Chrome, the path is Settings, Apps, Chrome, Notifications, then this book’s site, then Sound.</p>
     </section>
   `);
@@ -393,7 +458,7 @@ function soundView() {
 function privacyView() {
   return shell(`
     <h2 class="page-title">Privacy</h2>
-    <p>This is a family book for Lisa Miller and the people she invites. It is not a public social network.</p>
+    <p>This is a family book for ${esc(state.site?.brand?.owner || "the cook")} and the people they invite. It is not a public social network.</p>
     <section class="panel legal">
       <h3>What the book keeps</h3>
       <p>An account holds a name, an email, and a password. The password is stored as a code, not as the words you type. You can also add a short line about yourself and a portrait.</p>
@@ -422,7 +487,7 @@ function termsView() {
       <h3>Films and outside pages</h3>
       <p>A saved YouTube link is a bookmark. The film still belongs to the person who made it. Recipe pages opened from another site stay with that site.</p>
       <h3>Keeping the table pleasant</h3>
-      <p>Notes, comments, and messages should be fit for the whole family, including Lisa. A call is for someone who can answer. Something that does not belong in a family book can be taken down.</p>
+      <p>Notes, comments, and messages should be fit for the whole family, including ${esc(state.site?.brand?.audience || "the cook")}. A call is for someone who can answer. Something that does not belong in a family book can be taken down.</p>
     </section>
   `);
 }
@@ -431,12 +496,13 @@ function installCard(mode) {
   const ios = mode === "ios";
   const ready = mode === "ready";
   const kicker = ios ? "On iPhone" : ready ? "On this phone" : "On this device";
-  const title = ready ? "Install Lisa's book" : "Add Lisa's book";
+  const brand = state.site?.brand || {};
+  const title = ready ? (brand.installReady || "Install this book") : (brand.installAdd || "Add this book");
   const copy = ios
-    ? "Tap the Share button, then Add to Home Screen. The pink ribbon will sit with your apps, and the kitchen timer can keep its place."
+    ? (brand.installIos || "Tap the Share button, then Add to Home Screen.")
     : ready
-      ? "Put the book on your home screen. It opens like an app, dressed in pink and gold, and the timer keeps counting when the phone is locked."
-      : "Open the browser menu and choose Install app or Add to Home Screen. Look for the pink ribbon.";
+      ? (brand.installReadyBody || "Put the book on your home screen. It opens like an app, and the timer keeps counting when the phone is locked.")
+      : (brand.installHelp || "Open the browser menu and choose Install app or Add to Home Screen.");
   const install = ready ? `<button class="btn gold" type="button" data-action="install-app">Install</button>` : "";
   return `<div class="install-modal" id="install-modal" data-mode="${mode}" role="dialog" aria-labelledby="install-title">
     <div class="install-card">
@@ -450,7 +516,7 @@ function installCard(mode) {
 }
 
 function paintInstall() {
-  const hidden = !state.showInstall || installedAlready() || localStorage.getItem("lisa-install-hide");
+  const hidden = !state.showInstall || installedAlready() || localStorage.getItem(storeKey("install-hide"));
   const modal = document.getElementById("install-modal");
   if (hidden) {
     if (modal && !modal.classList.contains("leaving")) {
@@ -467,6 +533,7 @@ function paintInstall() {
 function matchingRecipes() {
   const q = state.q.trim().toLowerCase();
   return state.recipes.filter((recipe) => {
+    if (state.placeFocus && state.cuisine === "all" && state.place?.cuisines?.length && !state.place.cuisines.includes(recipe.cuisine)) return false;
     if (!matchesChip(recipe)) return false;
     if (!q) return true;
     const blob = [recipe.title, recipe.summary, recipe.category, recipe.notes, ...(recipe.ingredients || []), ...(recipe.steps || [])].join(" ").toLowerCase();
@@ -476,24 +543,52 @@ function matchingRecipes() {
 
 function reactionTarget(item) {
   const source = String(item.sourceUrl || "");
-  const fromSource = source.match(/themealdb\.com\/meal\/(\d+)/);
+  const fromSource = source.match(new RegExp(`${mealHost().replace(/\./g, "\\.")}/meal/(\\d+)`));
   const mealId = fromSource?.[1] || (item.world ? String(item.mealId || item.id || "").replace(/^mealdb-/, "") : "");
   if (mealId && /^\d+$/.test(mealId)) return { type: "world", id: `mealdb-${mealId}` };
   return { type: "recipe", id: String(item.id) };
 }
 
+function itemMatchesPlace(recipe) {
+  if (!state.placeFocus || !state.place?.cuisines?.length) return true;
+  return state.place.cuisines.includes(recipe.cuisine);
+}
+
+function cuisineChips() {
+  const chips = [["all", "All"], ["gym", "The Gym"], ["texas", "Texas"], ["texmex", "Tex-Mex"], ["stews", "Stews"], ["breakfast", "Breakfast"], ["sweets", "Sweets"], ["kids", "Little ones"], ["pets", "The Pet Connection"], ["garden", "Garden"], ["cajun", "Cajun"], ["library", "Kept"]];
+  const prefer = state.place?.cuisines || [];
+  if (!prefer.length) return chips;
+  const rank = new Map(prefer.map((id, index) => [id, index]));
+  const [all, ...rest] = chips;
+  rest.sort((a, b) => (rank.has(a[0]) ? rank.get(a[0]) : 100) - (rank.has(b[0]) ? rank.get(b[0]) : 100));
+  return [all, ...rest];
+}
+
+function placeBanner() {
+  const locate = `<button class="btn quiet" type="button" data-action="locate">Use this kitchen's place</button>`;
+  if (!state.place?.note) {
+    return `<section class="panel place-note"><p>The menu can follow the kitchen you are standing in. The book keeps the region, not the map pin.</p><div class="actions">${locate}</div></section>`;
+  }
+  const action = state.placeFocus
+    ? `<button class="btn quiet" type="button" data-action="whole-book">Whole book</button>`
+    : `<button class="btn quiet" type="button" data-action="near-me">Show nearby plates</button>`;
+  return `<section class="panel place-note"><p>${esc(state.place.note)}</p><div class="actions">${action}${locate}</div></section>`;
+}
+
 function home() {
   const list = matchingRecipes();
   const outside = Boolean(state.q.trim()) && !list.length;
-  const featured = state.recipes.find((recipe) => recipe.id === "oak-smoked-brisket") || state.recipes[0];
+  const featured = state.recipes.find((recipe) => itemMatchesPlace(recipe) && recipe.id === "oak-smoked-brisket") || state.recipes.find(itemMatchesPlace) || state.recipes[0];
+  const brand = state.site?.brand || {};
   return shell(`
     ${familyFeed()}
-    ${!state.q.trim() && state.cuisine === "all" ? stapleBands() : ""}
+    ${placeBanner()}
+    ${!state.q.trim() && state.cuisine === "all" && !state.placeFocus ? stapleBands() : ""}
     <section class="hero">
       <div class="hero-copy">
-        <p class="eyebrow">Cajun, Texas, and the open library</p>
-        <h2 class="page-title" style="font-size:clamp(42px,6vw,72px)">A table with your name on it.</h2>
-        <p>Your plates from the bayou and the Hill Country, dressed in survivor pink, with a whole library when you want something new.</p>
+        <p class="eyebrow">${esc(brand.heroEyebrow || "")}</p>
+        <h2 class="page-title" style="font-size:clamp(42px,6vw,72px)">${esc(brand.heroTitle || "A table with your name on it.")}</h2>
+        <p>${esc(brand.heroBody || "")}</p>
         <div class="actions">
           <a class="btn" href="#/library">Browse the library</a>
           <a class="btn quiet" href="#/new">Add a recipe</a>
@@ -504,7 +599,7 @@ function home() {
     </section>
     <div class="toolbar">
       <input id="q" placeholder="Search the book" value="${esc(state.q)}">
-      ${[["all", "All"], ["gym", "The Gym"], ["texas", "Texas"], ["texmex", "Tex-Mex"], ["stews", "Stews"], ["breakfast", "Breakfast"], ["sweets", "Sweets"], ["kids", "Little ones"], ["pets", "The Pet Connection"], ["garden", "Garden"], ["cajun", "Cajun"], ["library", "Kept"]].map(([item, label]) => `<button type="button" class="chip ${state.cuisine === item ? "active" : ""}" data-cuisine="${item}">${label}</button>`).join("")}
+      ${cuisineChips().map(([item, label]) => `<button type="button" class="chip ${state.cuisine === item && !state.placeFocus ? "active" : ""} ${item === "all" && state.placeFocus ? "active" : ""}" data-cuisine="${item}">${label}</button>`).join("")}
       <span class="empty">${list.length} recipes</span>
     </div>
     ${outside && state.bookHitNote ? `<p class="empty">${esc(state.bookHitNote)}</p>` : ""}
@@ -714,7 +809,7 @@ function card(recipe) {
 }
 
 function recipeView(recipe) {
-  const shareText = `${recipe.title} from Lisa's Recipe Book`;
+  const shareText = `${recipe.title} from ${bookName()}`;
   const link = recipeLink(recipe);
   const kept = recipe.world ? state.recipes.find((item) => item.sourceUrl === recipe.sourceUrl) : null;
   return shell(`
@@ -1266,11 +1361,11 @@ function render() {
   let html = "";
   if (current.name === "recipe") {
     const recipe = state.recipes.find((item) => item.id === current.id);
-    document.title = recipe ? `${recipe.title} · Lisa's Recipe Book` : "Lisa's Recipe Book";
+    document.title = recipe ? `${recipe.title} · ${bookName()}` : bookName();
     html = recipe ? recipeView(recipe) : shell(`<p>That recipe is not in the book.</p>`);
   } else if (current.name === "world") {
     const recipe = state.worldCache[current.id];
-    document.title = recipe ? `${recipe.title} · Lisa's Recipe Book` : "Library · Lisa's Recipe Book";
+    document.title = recipe ? `${recipe.title} · ${bookName()}` : `Library · ${bookName()}`;
     if (recipe) html = recipeView(recipe);
     else if (state.worldError && state.worldMiss === current.id && !state.worldLoading) {
       html = shell(`<p class="empty">${esc(state.worldError)}</p><button class="btn" data-action="retry-world">Try again</button>`);
@@ -1282,53 +1377,59 @@ function render() {
       }
     }
   } else if (current.name === "library") {
-    document.title = "Library · Lisa's Recipe Book";
+    document.title = `Library · ${bookName()}`;
     html = libraryView();
   } else if (current.name === "edit" || current.name === "new") {
-    document.title = "Write a recipe · Lisa's Recipe Book";
+    document.title = `Write a recipe · ${bookName()}`;
     const recipe = current.name === "edit" ? state.recipes.find((item) => item.id === current.id) : null;
     html = state.user ? editor(recipe) : accountGate("Log in before you add a recipe.");
   } else if (current.name === "notes") {
-    document.title = "Notepad · Lisa's Recipe Book";
+    document.title = `Notepad · ${bookName()}`;
     html = notesView();
   } else if (current.name === "studio") {
-    document.title = "Studio · Lisa's Recipe Book";
+    document.title = `Studio · ${bookName()}`;
     html = studio();
   } else if (current.name === "people") {
     const shown = (state.people || []).find((item) => String(item.id) === String(current.id)) || state.profile;
-    document.title = shown && String(shown.id) === String(current.id) ? `${shown.name} · Lisa's Recipe Book` : "Profile · Lisa's Recipe Book";
+    document.title = shown && String(shown.id) === String(current.id) ? `${shown.name} · ${bookName()}` : `Profile · ${bookName()}`;
     html = peopleView(current.id);
   } else if (current.name === "family") {
-    document.title = "Family · Lisa's Recipe Book";
+    document.title = `Family · ${bookName()}`;
     html = familyView();
   } else if (current.name === "profile" || current.name === "account") {
-    document.title = current.name === "account" ? "Log in · Lisa's Recipe Book" : "Profile · Lisa's Recipe Book";
+    document.title = current.name === "account" ? `Log in · ${bookName()}` : `Profile · ${bookName()}`;
     html = current.name === "profile" ? profile() : accountGate("Log in with your email and password. First time here? Create an account in the next box.");
   } else if (current.name === "messages") {
-    document.title = "Messages · Lisa's Recipe Book";
+    document.title = `Messages · ${bookName()}`;
     html = state.user ? shell(messagesView()) : accountGate("Log in to send a message or make a call.");
   } else if (current.name === "sound") {
-    document.title = "Call sound · Lisa's Recipe Book";
+    document.title = `Call sound · ${bookName()}`;
     html = soundView();
   } else if (current.name === "search") {
-    document.title = "Search · Lisa's Recipe Book";
+    document.title = `Search · ${bookName()}`;
     html = shell(searchView());
   } else if (current.name === "comments") {
     const place = commentPlace(current.id, current.more);
-    document.title = `Comments · ${place.title} · Lisa's Recipe Book`;
+    document.title = `Comments · ${place.title} · ${bookName()}`;
     html = commentsView(current.id, current.more);
     if (current.id === "world" && current.more && !state.worldCache[String(current.more).replace(/^mealdb-/, "")] && state.worldMiss !== String(current.more).replace(/^mealdb-/, "")) {
       state.worldMiss = String(current.more).replace(/^mealdb-/, "");
       ensureWorld(state.worldMiss);
     }
+  } else if (current.name === "support") {
+    document.title = `Kitchen fund · ${bookName()}`;
+    html = supportView();
+  } else if (current.name === "setup") {
+    document.title = `Book setup · ${bookName()}`;
+    html = setupView();
   } else if (current.name === "privacy") {
-    document.title = "Privacy · Lisa's Recipe Book";
+    document.title = `Privacy · ${bookName()}`;
     html = privacyView();
   } else if (current.name === "terms") {
-    document.title = "Terms of use · Lisa's Recipe Book";
+    document.title = `Terms of use · ${bookName()}`;
     html = termsView();
   } else {
-    document.title = "Lisa's Recipe Book";
+    document.title = bookName();
     html = home();
   }
   if (state.incoming) document.title = `${state.incoming.person?.name || "Someone"} is calling`;
@@ -1480,7 +1581,12 @@ document.addEventListener("click", async (event) => {
     return;
   }
   if (button.closest("a.card")) event.preventDefault();
-  if (button.dataset.cuisine) { state.cuisine = button.dataset.cuisine; render(); return; }
+  if (button.dataset.cuisine) {
+    state.cuisine = button.dataset.cuisine;
+    state.placeFocus = false;
+    render();
+    return;
+  }
   if (button.dataset.shelf) {
     state.shelfCategory = button.dataset.shelf;
     state.shelfQ = "";
@@ -1514,7 +1620,10 @@ document.addEventListener("click", async (event) => {
       input.type = showing ? "password" : "text";
       button.textContent = showing ? "Show password" : "Hide password";
     }
-    if (action === "dismiss-install") { localStorage.setItem("lisa-install-hide", "1"); state.showInstall = ""; render(); }
+    if (action === "dismiss-install") { localStorage.setItem(storeKey("install-hide"), "1"); state.showInstall = ""; render(); }
+    if (action === "locate") { await locateKitchen(); return; }
+    if (action === "whole-book") { state.placeFocus = false; render(); return; }
+    if (action === "near-me") { state.placeFocus = true; state.cuisine = "all"; render(); return; }
     if (action === "open-source") {
       const current = state.recipes.find((item) => item.id === route().id);
       await openSource(button.dataset.url, button.dataset.title, current);
@@ -1651,7 +1760,7 @@ document.addEventListener("click", async (event) => {
       return;
     }
     if (action === "sign-out") {
-      localStorage.removeItem("lisa-token");
+      localStorage.removeItem(storeKey("token"));
       state.user = null;
       state.menu = false;
       if (!location.hash || location.hash === "#/" || location.hash === "#") render();
@@ -1825,6 +1934,31 @@ document.addEventListener("submit", async (event) => {
   const data = Object.fromEntries(new FormData(form).entries());
   try {
     if (await deskSubmit(form, data)) return;
+    if (form.dataset.action === "pay") {
+      const dollars = Number(data.dollars);
+      const amountCents = Math.round(dollars * 100);
+      const result = await api("/api/payments/checkout", { method: "POST", json: { portal: data.portal, amountCents, note: data.note } });
+      state.orders = [result.order, ...(state.orders || [])];
+      say("Checkout is open.");
+      if (result.order?.checkoutUrl) window.open(result.order.checkoutUrl, "_blank", "noopener");
+      render();
+      return;
+    }
+    if (form.dataset.action === "save-setup") {
+      const result = await api("/api/site", {
+        method: "PATCH",
+        json: {
+          brand: { name: data.name, eyebrow: data.eyebrow, owner: data.owner },
+          theme: { moss: data.moss, paper: data.paper, themeColor: data.moss, clay: data.moss },
+          domain: { customDomain: data.customDomain, subdomain: data.subdomain }
+        }
+      });
+      state.site = result.site;
+      applySite(state.site);
+      say("This book is dressed.");
+      render();
+      return;
+    }
     if (form.classList.contains("comment-form")) {
       const text = String(data.body || "").trim();
       const type = form.dataset.type;
@@ -1858,7 +1992,7 @@ document.addEventListener("submit", async (event) => {
     }
     if (form.id === "register-form" || form.id === "login-form") {
       const result = await api(form.id === "login-form" ? "/api/auth/login" : "/api/auth/register", { method: "POST", json: data });
-      localStorage.setItem("lisa-token", result.token);
+      localStorage.setItem(storeKey("token"), result.token);
       state.user = result.user;
       await refreshPrivate();
       say(`Welcome, ${result.user.name}.`);
@@ -2279,7 +2413,7 @@ document.addEventListener("keydown", (event) => {
 });
 
 function saveTimer() {
-  localStorage.setItem("lisa-timer", JSON.stringify({
+  localStorage.setItem(storeKey("timer"), JSON.stringify({
     endAt: timer.running ? timer.endAt : 0,
     pausedRemaining: timer.running ? 0 : timer.pausedRemaining,
     alerted: timer.alerted
@@ -2322,19 +2456,19 @@ async function scheduleTimerAlert(endAt) {
   }
   if (Notification.permission !== "granted") return;
   const registration = await navigator.serviceWorker.ready;
-  const pending = await registration.getNotifications({ tag: "lisa-timer" }).catch(() => []);
+  const pending = await registration.getNotifications({ tag: storeKey("timer") }).catch(() => []);
   pending.forEach((note) => note.close());
   if ("TimestampTrigger" in window) {
     try {
-      await registration.showNotification("Lisa's Recipe Book", {
+      await registration.showNotification(bookName(), {
         body: "The timer is up.",
-        tag: "lisa-timer",
+        tag: storeKey("timer"),
         showTrigger: new TimestampTrigger(endAt)
       });
       return;
     } catch { /* the service worker will watch the clock instead */ }
   }
-  registration.active?.postMessage({ type: "timer-start", endAt });
+  registration.active?.postMessage({ type: "timer-start", endAt, title: bookName(), tag: storeKey("timer") });
 }
 
 function clearTimerAlert() {
@@ -2373,14 +2507,14 @@ function finishTimer() {
   timer.pausedRemaining = 0;
   stopTicker();
   releaseScreen();
-  localStorage.removeItem("lisa-timer");
+  localStorage.removeItem(storeKey("timer"));
   beep();
   say("The timer is up.");
   if (navigator.serviceWorker && Notification.permission === "granted") {
     navigator.serviceWorker.ready.then((registration) => {
-      registration.showNotification("Lisa's Recipe Book", {
+      registration.showNotification(bookName(), {
         body: "The timer is up.",
-        tag: "lisa-timer",
+        tag: storeKey("timer"),
         renotify: true
       });
     }).catch(() => {});
@@ -2395,7 +2529,7 @@ function tickTimer() {
 
 function restoreTimer() {
   try {
-    const saved = JSON.parse(localStorage.getItem("lisa-timer") || "null");
+    const saved = JSON.parse(localStorage.getItem(storeKey("timer")) || "null");
     if (!saved) return;
     if (saved.endAt && saved.endAt > Date.now()) {
       timer.endAt = saved.endAt;
@@ -2448,7 +2582,7 @@ function resetTimer() {
   stopTicker();
   releaseScreen();
   clearTimerAlert();
-  localStorage.removeItem("lisa-timer");
+  localStorage.removeItem(storeKey("timer"));
   render();
 }
 
@@ -2457,13 +2591,13 @@ async function installApp() {
   deferredInstall.prompt();
   const choice = await deferredInstall.userChoice.catch(() => null);
   deferredInstall = null;
-  if (choice?.outcome === "accepted") localStorage.setItem("lisa-install-hide", "1");
+  if (choice?.outcome === "accepted") localStorage.setItem(storeKey("install-hide"), "1");
   state.showInstall = "";
   render();
 }
 
 function offerInstall() {
-  if (installedAlready() || localStorage.getItem("lisa-install-hide")) return;
+  if (installedAlready() || localStorage.getItem(storeKey("install-hide"))) return;
   const ios = /iphone|ipad|ipod/i.test(navigator.userAgent);
   const android = /android/i.test(navigator.userAgent);
   if (ios) state.showInstall = "ios";
@@ -2474,14 +2608,14 @@ function offerInstall() {
 
 async function rememberIfInstalled() {
   if (installedAlready()) {
-    localStorage.setItem("lisa-install-hide", "1");
+    localStorage.setItem(storeKey("install-hide"), "1");
     state.showInstall = "";
     return;
   }
   try {
     const related = await navigator.getInstalledRelatedApps?.();
     if (related?.length) {
-      localStorage.setItem("lisa-install-hide", "1");
+      localStorage.setItem(storeKey("install-hide"), "1");
       state.showInstall = "";
     }
   } catch { /* the card can still be closed by hand */ }
@@ -2490,14 +2624,14 @@ async function rememberIfInstalled() {
 window.addEventListener("beforeinstallprompt", (event) => {
   event.preventDefault();
   deferredInstall = event;
-  if (!localStorage.getItem("lisa-install-hide") && !installedAlready()) {
+  if (!localStorage.getItem(storeKey("install-hide")) && !installedAlready()) {
     state.showInstall = "ready";
     render();
   }
 });
 
 window.addEventListener("appinstalled", () => {
-  localStorage.setItem("lisa-install-hide", "1");
+  localStorage.setItem(storeKey("install-hide"), "1");
   state.showInstall = "";
   deferredInstall = null;
   render();
@@ -2505,7 +2639,7 @@ window.addEventListener("appinstalled", () => {
 
 document.addEventListener("visibilitychange", () => {
   if (installedAlready()) {
-    localStorage.setItem("lisa-install-hide", "1");
+    localStorage.setItem(storeKey("install-hide"), "1");
     state.showInstall = "";
     paintInstall();
   }
@@ -2517,7 +2651,7 @@ document.addEventListener("visibilitychange", () => {
 
 window.addEventListener("pageshow", () => tickTimer());
 
-if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js?v=4").catch(() => {});
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js?v=5").catch(() => {});
 restoreTimer();
 await rememberIfInstalled();
 offerInstall();
@@ -2538,7 +2672,38 @@ async function openSpokenFind(forced) {
   }
 }
 
-const boot = await api("/api/health").then(() => api("/api/recipes")).catch((error) => ({ error }));
+async function locateKitchen() {
+  if (!navigator.geolocation) {
+    say("This browser has no place to share.");
+    return;
+  }
+  const position = await new Promise((resolve, reject) => {
+    navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: false, timeout: 8000, maximumAge: 300000 });
+  }).catch(() => null);
+  await loadPlace(position ? { lat: position.coords.latitude, lng: position.coords.longitude } : null);
+}
+
+async function loadPlace(coords) {
+  const query = coords ? `?lat=${encodeURIComponent(coords.lat)}&lng=${encodeURIComponent(coords.lng)}` : "";
+  try {
+    const data = await api(`/api/location/menu${query}`);
+    state.place = data.menu;
+    state.placeFocus = Boolean(data.menu?.cuisines?.length);
+  } catch { /* the whole book stays on the table */ }
+}
+
+async function loadSite() {
+  try {
+    const data = await api("/api/site");
+    if (data.site) state.site = data.site;
+  } catch { /* the baked-in book still opens */ }
+  applySite(state.site);
+  const granted = await navigator.permissions?.query?.({ name: "geolocation" }).then((result) => result.state === "granted").catch(() => false);
+  if (granted) await locateKitchen();
+  else await loadPlace(null);
+}
+
+const boot = await loadSite().then(() => api("/api/health")).then(() => api("/api/recipes")).catch((error) => ({ error }));
 if (boot.error) {
   document.getElementById("app").innerHTML = `<p class="boot">${esc(boot.error)}</p>`;
 } else {
@@ -2547,7 +2712,13 @@ if (boot.error) {
   try {
     const me = await api("/api/auth/me");
     state.user = me.user;
-    if (state.user) await refreshPrivate();
+    if (state.user) {
+    await refreshPrivate();
+    if (state.site?.payments?.enabled) {
+      const payments = await api("/api/payments/orders").catch(() => ({ orders: [] }));
+      state.orders = payments.orders || [];
+    }
+  }
   } catch { /* a guest can still read */ }
   bindDesk({ state, api, esc, go, say, face, render, route });
   state.ringerName = await ringerLabel().catch(() => "");

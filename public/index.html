@@ -3,13 +3,13 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Lisa's Recipe Book</title>
-  <meta name="description" content="Cajun and Texas recipes kept for Lisa Miller, with room for her own notes, pictures, and films.">
+  <title>Cookbook</title>
+  <meta name="description" content="A family cookbook.">
   <meta name="theme-color" content="#d81b60">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
-  <meta name="apple-mobile-web-app-title" content="Lisa's Book">
+  <meta name="apple-mobile-web-app-title" content="Cookbook">
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/ribbon.svg">
   <link rel="apple-touch-icon" href="/icons/icon-192.png">
@@ -17,24 +17,40 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,520;9..144,650&family=Outfit:wght@400;500;640&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
-  <link rel="stylesheet" href="/css/app.css?v=29">
-  <script type="application/ld+json">
-  {
-    "@context": "https://schema.org",
-    "@type": "WebSite",
-    "name": "Lisa's Recipe Book",
-    "url": "https://lisa.synthetix-labz.cloud/",
-    "potentialAction": {
-      "@type": "SearchAction",
-      "target": "https://lisa.synthetix-labz.cloud/?find={search_term_string}",
-      "query-input": "required name=search_term_string"
-    }
-  }
+  <link rel="stylesheet" href="/css/app.css?v=30">
+  <script src="/config.js"></script>
+  <script>
+    (function () {
+      var site = window.APP_CONFIG && window.APP_CONFIG.site;
+      if (!site || !site.brand) return;
+      document.title = site.brand.name || document.title;
+      var description = document.querySelector('meta[name="description"]');
+      if (description && site.brand.description) description.setAttribute("content", site.brand.description);
+      var theme = document.querySelector('meta[name="theme-color"]');
+      if (theme && site.theme && site.theme.themeColor) theme.setAttribute("content", site.theme.themeColor);
+      var apple = document.querySelector('meta[name="apple-mobile-web-app-title"]');
+      if (apple) apple.setAttribute("content", site.brand.shortName || site.brand.name);
+      var data = {
+        "@context": "https://schema.org",
+        "@type": "WebSite",
+        "name": site.brand.name,
+        "url": (site.domain && site.domain.canonical) || location.origin + "/",
+        "potentialAction": {
+          "@type": "SearchAction",
+          "target": ((site.domain && site.domain.canonical) || location.origin + "/") + "?find={search_term_string}",
+          "query-input": "required name=search_term_string"
+        }
+      };
+      var script = document.createElement("script");
+      script.type = "application/ld+json";
+      script.textContent = JSON.stringify(data);
+      document.head.appendChild(script);
+    })();
   </script>
 </head>
 <body>
   <div id="app"><p class="boot">Setting the table…</p></div>
   <script src="/config.js"></script>
-  <script src="/js/app.js?v=39" type="module"></script>
+  <script src="/js/app.js?v=40" type="module"></script>
 </body>
 </html>
