@@ -1,4 +1,6 @@
-const BASE = "https://www.themealdb.com/api/json/v1/1";
+import { services } from "../shared/brand-config.js";
+
+const BASE = services.mealDbApi;
 const cache = new Map();
 
 async function cached(url) {
@@ -39,7 +41,7 @@ function ingredientsFrom(meal) {
 
 export function mapMeal(meal) {
   const id = String(meal.idMeal);
-  const source = `https://www.themealdb.com/meal/${id}`;
+  const source = `${services.mealDbMeal}${id}`;
   const notes = [meal.strYoutube ? `Film: ${meal.strYoutube}` : "", meal.strTags ? `Tags: ${meal.strTags}` : ""]
     .filter(Boolean)
     .join("\n");

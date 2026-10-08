@@ -1,6 +1,7 @@
 import { lookup } from "node:dns/promises";
 import net from "node:net";
 import * as cheerio from "cheerio";
+import { services } from "../shared/brand-config.js";
 
 function blockedIp(ip) {
   if (net.isIP(ip) === 4) {
@@ -87,7 +88,7 @@ export async function browse(raw) {
     response = await fetch(current, {
       redirect: "manual",
       headers: {
-        "User-Agent": "LisasRecipeBook/1.0 (personal cookbook reader)",
+        "User-Agent": services.userAgent,
         Accept: "text/html,application/xhtml+xml"
       },
       signal: AbortSignal.timeout(12000)

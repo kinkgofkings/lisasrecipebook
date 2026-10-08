@@ -123,3 +123,23 @@ CREATE TABLE IF NOT EXISTS comments (
   attachments TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL
 );
+ALTER TABLE users ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'lisa';
+ALTER TABLE recipes ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS orders (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  user_id INTEGER NOT NULL,
+  portal TEXT NOT NULL,
+  amount_cents INTEGER NOT NULL,
+  currency TEXT NOT NULL DEFAULT 'USD',
+  note TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL,
+  external_id TEXT NOT NULL DEFAULT '',
+  checkout_url TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tenant_overrides (
+  tenant_id TEXT PRIMARY KEY,
+  document TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);

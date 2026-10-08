@@ -3,7 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node --disable-warning=ExperimentalWarning server/index.js"
+    "start": "node --disable-warning=ExperimentalWarning server/index.js",
+    "test": "node --test scripts/white-label.test.mjs",
+    "emit-config": "node scripts/emit-public-config.mjs"
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",

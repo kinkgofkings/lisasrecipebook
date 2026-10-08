@@ -3,8 +3,13 @@ import { findCover, paintCover } from "../../server/cover.js";
 import { browse, watchClip } from "./browse.js";
 import {
   addSignal, askHost, d1Desk, deskSnapshot, ensureDesk, getCall, listSignals, listThreads,
-  placeCall, readThread, searchBook, sendMessage, setCall
+  placeCall, readThread, scopeDesk, searchBook, sendMessage, setCall
 } from "../../server/desk.js";
+import {
+  canCustomize, catalogSites, defaultTenantId, domainTaken, publicSite, recipeVisible,
+  regionFor, resolveSite, sanitizeBrand, sanitizeHost, sanitizeTheme, sessionAllowed, siteForHost, tenantForHost
+} from "../../shared/white-label.js";
+import { cashAppEvent, cashAppSignatureValid, publicOrder, squareEvent, squareSignatureValid, startCheckout } from "../../shared/payments.js";
 
 function json(data, status = 200) {
   return Response.json(data, {
@@ -67,6 +72,7 @@ function sameBytes(left, right) {
 async function signToken(env, userId) {
   const body = bytesToBase64Url(new TextEncoder().encode(JSON.stringify({
     id: userId,
+    tenant: env.SITE?.id || "",
     exp: Date.now() + 1000 * 60 * 60 * 24 * 30
   })));
   const signature = bytesToBase64Url(await hmac(env.AUTH_SECRET, body));
@@ -107,8 +113,12 @@ async function checkPassword(env, password, stored) {
 
 async function userFrom(env, request) {
   const payload = await readToken(env, request.headers.get("authorization") || "");
-  if (!payload) return null;
-  return env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(payload.id).first();
+  const site = env.SITE;
+  if (!payload || !site || !sessionAllowed(payload, site.id, defaultTenantId())) return null;
+  const user = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(payload.id).first();
+  if (!user) return null;
+  if ((user.tenant_id || defaultTenantId()) !== site.id) return null;
+  return user;
 }
 
 async function recipeRow(env, row) {
@@ -249,7 +259,29 @@ async function uploadMedia(request, env, recipeId, url) {
 let bookReady = null;
 function prepareBook(env) {
   if (!bookReady) {
-    bookReady = env.DB.prepare("ALTER TABLE comments ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'").run().catch(() => {});
+    bookReady = Promise.all([
+      env.DB.prepare("ALTER TABLE comments ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'").run().catch(() => {}),
+      env.DB.prepare("ALTER TABLE users ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'lisa'").run().catch(() => {}),
+      env.DB.prepare("ALTER TABLE recipes ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''").run().catch(() => {}),
+      env.DB.prepare(`CREATE TABLE IF NOT EXISTS orders (
+        id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        user_id INTEGER NOT NULL,
+        portal TEXT NOT NULL,
+        amount_cents INTEGER NOT NULL,
+        currency TEXT NOT NULL DEFAULT 'USD',
+        note TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL,
+        external_id TEXT NOT NULL DEFAULT '',
+        checkout_url TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      )`).run(),
+      env.DB.prepare(`CREATE TABLE IF NOT EXISTS tenant_overrides (
+        tenant_id TEXT PRIMARY KEY,
+        document TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`).run()
+    ]);
   }
   return bookReady;
 }
@@ -265,6 +297,7 @@ export async function handle(request, env) {
   const url = new URL(request.url);
   const parts = url.pathname.split("/").filter(Boolean);
   if (parts[0] !== "api") return json({ error: "That page is not in the book." }, 404);
+  const bag = { site: tenantForHost(url.hostname) };
   let session = null;
   const bound = new Proxy(env, {
     get(target, prop, receiver) {
@@ -272,11 +305,16 @@ export async function handle(request, env) {
         if (!session) session = liveDb(target);
         return session;
       }
+      if (prop === "SITE") return bag.site;
       return Reflect.get(target, prop, receiver);
     }
   });
   try {
     await prepareBook(bound);
+    bag.site = await siteForHost(url.hostname, async (id) => {
+      const row = await bound.DB.prepare("SELECT document FROM tenant_overrides WHERE tenant_id = ?").bind(id).first();
+      return row?.document || "";
+    });
     return await route(request, bound, url, parts.slice(1));
   } catch (error) {
     const status = error.status || 500;
@@ -290,7 +328,14 @@ async function route(request, env, url, parts) {
   const method = request.method;
   const [first, second, third, fourth] = parts;
 
-  if (method === "GET" && first === "health") return json({ ok: true, name: "Lisa's Recipe Book" });
+  if (method === "GET" && first === "health") return json({ ok: true, name: env.SITE.brand.name, tenant: env.SITE.id });
+  if (first === "site" && !second && method === "GET") return siteView(request, env);
+  if (first === "site" && !second && method === "PATCH") return siteUpdate(request, env);
+  if (first === "location" && second === "menu" && method === "GET") return json({ menu: regionFor(env.SITE, { lat: url.searchParams.get("lat"), lng: url.searchParams.get("lng") }) });
+  if (first === "payments" && second === "portals" && method === "GET") return json({ payments: publicSite(env.SITE, { env }).payments });
+  if (first === "payments" && second === "orders" && method === "GET") return paymentOrders(request, env);
+  if (first === "payments" && second === "checkout" && method === "POST") return paymentCheckout(request, env);
+  if (first === "payments" && second === "webhook" && third && method === "POST") return paymentWebhook(request, env, third);
 
   if (first === "auth" && second === "register" && method === "POST") return register(request, env);
   if (first === "auth" && second === "login" && method === "POST") return login(request, env);
@@ -350,7 +395,7 @@ async function deskRoute(request, env, method, first, second, third, url) {
     });
   }
   await deskReady;
-  const db = d1Desk(env.DB);
+  const db = scopeDesk(d1Desk(env.DB), env.SITE.id);
   const user = await userFrom(env, request);
   const need = () => {
     if (!user) throw Object.assign(new Error("Log in first."), { status: 401 });
@@ -404,9 +449,9 @@ async function register(request, env) {
   if (password.length < 8) return json({ error: "Use a password of at least 8 characters." }, 400);
   try {
     const result = await env.DB.prepare(`
-      INSERT INTO users (email, password_hash, name, bio, avatar_path, created_at)
-      VALUES (?, ?, ?, '', '', ?)
-    `).bind(email, await hashPassword(env, password), name, new Date().toISOString()).run();
+      INSERT INTO users (email, password_hash, name, bio, avatar_path, created_at, tenant_id)
+      VALUES (?, ?, ?, '', '', ?, ?)
+    `).bind(email, await hashPassword(env, password), name, new Date().toISOString(), env.SITE.id).run();
     const user = await env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(result.meta.last_row_id).first();
     return json({ token: await signToken(env, user.id), user: publicUser(user) }, 201);
   } catch (error) {
@@ -419,7 +464,7 @@ async function login(request, env) {
   const body = await readJson(request);
   const email = String(body.email || "").trim().toLowerCase();
   const password = String(body.password || "");
-  const user = await env.DB.prepare("SELECT * FROM users WHERE email = ?").bind(email).first();
+  const user = await env.DB.prepare("SELECT * FROM users WHERE email = ? AND tenant_id = ?").bind(email, env.SITE.id).first();
   if (!user || !(await checkPassword(env, password, user.password_hash))) {
     return json({ error: "That email and password do not match." }, 401);
   }
@@ -452,8 +497,9 @@ async function listRecipes(request, url, env) {
     SELECT * FROM recipes
     WHERE (? = '' OR cuisine = ?)
       AND (? = '' OR title LIKE ? OR summary LIKE ?)
+      AND (tenant_id = '' OR tenant_id = ?)
     ORDER BY family DESC, title COLLATE NOCASE
-  `).bind(cuisine, cuisine, q, `%${q}%`, `%${q}%`).all();
+  `).bind(cuisine, cuisine, q, `%${q}%`, `%${q}%`, env.SITE.id).all();
   const recipes = [];
   for (const row of rows.results || []) recipes.push(await recipeRow(env, row));
   return json({ recipes: await decorateRecipes(env, user, recipes) });
@@ -461,8 +507,9 @@ async function listRecipes(request, url, env) {
 
 async function oneRecipe(request, env, id) {
   const user = await userFrom(env, request);
-  const recipe = await recipeRow(env, await env.DB.prepare("SELECT * FROM recipes WHERE id = ?").bind(id).first());
-  if (!recipe) return json({ error: "That recipe is not in the book." }, 404);
+  const row = await env.DB.prepare("SELECT * FROM recipes WHERE id = ?").bind(id).first();
+  if (!row || !recipeVisible(row, env.SITE.id)) return json({ error: "That recipe is not in the book." }, 404);
+  const recipe = await recipeRow(env, row);
   const [decorated] = await decorateRecipes(env, user, [recipe]);
   return json({ recipe: decorated });
 }
@@ -487,7 +534,7 @@ async function createRecipe(request, env) {
     const painted = await paintCover(env.AI, title);
     if (painted) {
       image = await storeChunked(env, "image/jpeg", painted, "cover.jpg");
-      imageCredit = "Photograph for Lisa's Recipe Book";
+      imageCredit = env.SITE.brand.imageCredit;
     }
   }
   if (!image) return json({ error: "Add a picture of this plate before saving it." }, 400);
@@ -497,8 +544,8 @@ async function createRecipe(request, env) {
     INSERT INTO recipes (
       id, title, cuisine, category, summary, yield_text, prep_minutes, cook_minutes,
       ingredients, steps, notes, image, image_credit, source_url, source_title, family, author_id,
-      created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+      created_at, updated_at, tenant_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
   `).bind(
     id,
     title,
@@ -517,7 +564,8 @@ async function createRecipe(request, env) {
     String(body.sourceTitle || "").slice(0, 160),
     user.id,
     now,
-    now
+    now,
+    env.SITE.id
   ).run();
   return savedRecipe(env, user, id, 201);
 }
@@ -526,7 +574,7 @@ async function updateRecipe(request, env, id) {
   const user = await userFrom(env, request);
   if (!user) return json({ error: "Sign in first." }, 401);
   const existing = await env.DB.prepare("SELECT * FROM recipes WHERE id = ?").bind(id).first();
-  if (!existing) return json({ error: "That recipe is not in the book." }, 404);
+  if (!existing || !recipeVisible(existing, env.SITE.id)) return json({ error: "That recipe is not in the book." }, 404);
   if (existing.author_id && String(existing.author_id) !== String(user.id)) {
     return json({ error: "Only the person who added that recipe can change it." }, 403);
   }
@@ -568,7 +616,7 @@ async function deleteRecipe(request, env, id) {
   const user = await userFrom(env, request);
   if (!user) return json({ error: "Sign in first." }, 401);
   const existing = await env.DB.prepare("SELECT id, author_id FROM recipes WHERE id = ?").bind(id).first();
-  if (!existing) return json({ error: "That recipe is not in the book." }, 404);
+  if (!existing || !recipeVisible(existing, env.SITE.id)) return json({ error: "That recipe is not in the book." }, 404);
   if (existing.author_id && String(existing.author_id) !== String(user.id)) {
     return json({ error: "Only the person who added that recipe can delete it." }, 403);
   }
@@ -730,7 +778,7 @@ async function targetExists(env, type, id) {
 async function listPeople(request, env) {
   const user = await userFrom(env, request);
   if (!user) return json({ error: "Sign in first." }, 401);
-  const people = await env.DB.prepare("SELECT id, name, bio, avatar_path FROM users ORDER BY name COLLATE NOCASE").all();
+  const people = await env.DB.prepare("SELECT id, name, bio, avatar_path FROM users WHERE tenant_id = ? ORDER BY name COLLATE NOCASE").bind(env.SITE.id).all();
   const follows = await env.DB.prepare("SELECT follower_id AS followerId, following_id AS followingId FROM follows").all();
   const rows = follows.results || [];
   const listed = people.results || [];
@@ -748,7 +796,7 @@ async function listPeople(request, env) {
 async function onePerson(request, env, id) {
   const user = await userFrom(env, request);
   if (!user) return json({ error: "Sign in first." }, 401);
-  const row = await env.DB.prepare("SELECT id, name, bio, avatar_path FROM users WHERE id = ?").bind(id).first();
+  const row = await env.DB.prepare("SELECT id, name, bio, avatar_path FROM users WHERE id = ? AND tenant_id = ?").bind(id, env.SITE.id).first();
   if (!row) return json({ error: "That person is not in the book." }, 404);
   const follows = await env.DB.prepare("SELECT follower_id AS followerId, following_id AS followingId FROM follows WHERE following_id = ? OR follower_id = ?").bind(id, user.id).all();
   const rows = follows.results || [];
@@ -767,7 +815,7 @@ async function toggleFollow(request, env, id) {
   const user = await userFrom(env, request);
   if (!user) return json({ error: "Sign in first." }, 401);
   if (String(user.id) === String(id)) return json({ error: "That is your own account." }, 400);
-  const other = await env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(id).first();
+  const other = await env.DB.prepare("SELECT id FROM users WHERE id = ? AND tenant_id = ?").bind(id, env.SITE.id).first();
   if (!other) return json({ error: "That person is not in the book." }, 404);
   const existing = await env.DB.prepare("SELECT 1 AS found FROM follows WHERE follower_id = ? AND following_id = ?").bind(user.id, id).first();
   if (existing) {
@@ -1311,7 +1359,7 @@ async function worldKeep(request, env, mealId) {
   if (!user) return json({ error: "Sign in first." }, 401);
   try {
     const recipe = await worldRecipe(mealId);
-    const existing = await env.DB.prepare("SELECT id FROM recipes WHERE source_url = ?").bind(recipe.sourceUrl).first();
+    const existing = await env.DB.prepare("SELECT id FROM recipes WHERE source_url = ? AND (tenant_id = '' OR tenant_id = ?)").bind(recipe.sourceUrl, env.SITE.id).first();
     if (existing) {
       return savedRecipe(env, user, existing.id);
     }
@@ -1325,7 +1373,7 @@ async function worldKeep(request, env, mealId) {
       const painted = await paintCover(env.AI, recipe.title);
       if (painted) {
         image = await storeChunked(env, "image/jpeg", painted, "cover.jpg");
-        imageCredit = "Photograph for Lisa's Recipe Book";
+        imageCredit = env.SITE.brand.imageCredit;
       }
     }
     if (!image) return json({ error: "That plate needs a picture before it can be kept." }, 400);
@@ -1335,12 +1383,12 @@ async function worldKeep(request, env, mealId) {
       INSERT INTO recipes (
         id, title, cuisine, category, summary, yield_text, prep_minutes, cook_minutes,
         ingredients, steps, notes, image, image_credit, source_url, source_title, family, author_id,
-        created_at, updated_at
-      ) VALUES (?, ?, 'library', ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+        created_at, updated_at, tenant_id
+      ) VALUES (?, ?, 'library', ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
     `).bind(
       id, recipe.title, recipe.category, recipe.summary, recipe.yieldText,
       JSON.stringify(recipe.ingredients), JSON.stringify(recipe.steps), recipe.notes,
-      image, imageCredit, recipe.sourceUrl, recipe.sourceTitle, user.id, now, now
+      image, imageCredit, recipe.sourceUrl, recipe.sourceTitle, user.id, now, now, env.SITE.id
     ).run();
     return savedRecipe(env, user, id, 201);
   } catch (error) {
@@ -1361,5 +1409,111 @@ async function openBrowse(url) {
     return json(await browse(String(url.searchParams.get("url") || "")));
   } catch (error) {
     return json({ error: error.status ? error.message : "That page could not be opened." }, error.status || 500);
+  }
+}
+
+async function siteView(request, env) {
+  const user = await userFrom(env, request);
+  return json({ site: publicSite(env.SITE, { canCustomize: canCustomize(env.SITE, user), env }) });
+}
+
+async function siteUpdate(request, env) {
+  const user = await userFrom(env, request);
+  if (!user) return json({ error: "Sign in first." }, 401);
+  if (!canCustomize(env.SITE, user)) return json({ error: "This book is styled from its configuration." }, 403);
+  const body = await readJson(request);
+  const host = sanitizeHost(body?.domain?.customDomain || "");
+  if (body?.domain?.customDomain && !host) return json({ error: "That domain name does not look right." }, 400);
+  if (host) {
+    const sites = [];
+    for (const site of catalogSites()) {
+      const row = await env.DB.prepare("SELECT document FROM tenant_overrides WHERE tenant_id = ?").bind(site.id).first();
+      sites.push(resolveSite(site.hosts[0], row?.document || ""));
+    }
+    if (domainTaken(host, env.SITE.id, sites)) return json({ error: "That domain is already used by another book." }, 409);
+  }
+  const document = JSON.stringify({
+    brand: sanitizeBrand(body?.brand),
+    theme: sanitizeTheme(body?.theme),
+    domain: { customDomain: host, subdomain: String(body?.domain?.subdomain || "").trim().toLowerCase() }
+  });
+  const now = new Date().toISOString();
+  await env.DB.prepare(`
+    INSERT INTO tenant_overrides (tenant_id, document, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(tenant_id) DO UPDATE SET document = excluded.document, updated_at = excluded.updated_at
+  `).bind(env.SITE.id, document, now).run();
+  const saved = await env.DB.prepare("SELECT document FROM tenant_overrides WHERE tenant_id = ?").bind(env.SITE.id).first();
+  const site = resolveSite(new URL(request.url).hostname, saved?.document || "");
+  return json({ site: publicSite(site, { canCustomize: true, env }) });
+}
+
+async function paymentOrders(request, env) {
+  const user = await userFrom(env, request);
+  if (!user) return json({ error: "Sign in first." }, 401);
+  const rows = await env.DB.prepare(`
+    SELECT id, portal, amount_cents AS amountCents, currency, note, status, checkout_url AS checkoutUrl, created_at AS createdAt
+    FROM orders WHERE tenant_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 20
+  `).bind(env.SITE.id, user.id).all();
+  return json({ orders: (rows.results || []).map(publicOrder) });
+}
+
+async function paymentCheckout(request, env) {
+  const user = await userFrom(env, request);
+  if (!user) return json({ error: "Sign in first." }, 401);
+  const body = await readJson(request);
+  try {
+    const order = await startCheckout({
+      site: env.SITE,
+      portal: String(body?.portal || ""),
+      amountCents: body?.amountCents,
+      note: body?.note,
+      user,
+      env,
+      async save(row) {
+        await env.DB.prepare(`
+          INSERT INTO orders (id, tenant_id, user_id, portal, amount_cents, currency, note, status, external_id, checkout_url, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(row.id, row.tenantId, row.userId, row.portal, row.amountCents, row.currency, row.note, row.status, row.externalId, row.checkoutUrl, row.createdAt).run();
+      }
+    });
+    return json({ order }, 201);
+  } catch (error) {
+    return json({ error: error.status ? error.message : "The payment desk could not open." }, error.status || 500);
+  }
+}
+
+async function paymentWebhook(request, env, portal) {
+  const body = await request.text();
+  try {
+    if (portal === "square") {
+      const ok = await squareSignatureValid({
+        key: env.SQUARE_WEBHOOK_SIGNATURE_KEY || "",
+        url: request.url,
+        body,
+        signature: request.headers.get("x-square-hmacsha256-signature") || ""
+      });
+      if (!ok) return json({ error: "That notice could not be verified." }, 401);
+      const event = squareEvent(JSON.parse(body || "{}"));
+      if (event.externalId && event.status) {
+        await env.DB.prepare("UPDATE orders SET status = ? WHERE external_id = ? AND status != 'paid'").bind(event.status, event.externalId).run();
+      }
+      return json({ ok: true });
+    }
+    if (portal === "cashapp") {
+      const ok = await cashAppSignatureValid({
+        key: env.CASHAPP_WEBHOOK_SECRET || "",
+        body,
+        signature: request.headers.get("x-cookbook-signature") || ""
+      });
+      if (!ok) return json({ error: "That notice could not be verified." }, 401);
+      const event = cashAppEvent(JSON.parse(body || "{}"));
+      if (event.orderId && event.status) {
+        await env.DB.prepare("UPDATE orders SET status = ? WHERE id = ? AND portal = 'cashapp' AND status != 'paid'").bind(event.status, event.orderId).run();
+      }
+      return json({ ok: true });
+    }
+    return json({ error: "That payment desk is not in the book." }, 404);
+  } catch {
+    return json({ error: "That notice could not be read." }, 400);
   }
 }

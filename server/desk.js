@@ -53,6 +53,15 @@ export function sqliteDesk(database) {
   };
 }
 
+export function scopeDesk(db, tenantId) {
+  return {
+    tenantId,
+    all: (sql, params) => db.all(sql, params),
+    get: (sql, params) => db.get(sql, params),
+    run: (sql, params) => db.run(sql, params)
+  };
+}
+
 export function d1Desk(database) {
   return {
     async all(sql, params = []) {
@@ -143,7 +152,10 @@ async function activeIds(db) {
 }
 
 async function otherUser(db, id) {
-  const row = await db.get("SELECT id, name, bio, avatar_path FROM users WHERE id = ?", [id]);
+  const tenantId = db.tenantId || "";
+  const row = tenantId
+    ? await db.get("SELECT id, name, bio, avatar_path FROM users WHERE id = ? AND tenant_id = ?", [id, tenantId])
+    : await db.get("SELECT id, name, bio, avatar_path FROM users WHERE id = ?", [id]);
   if (!row) throw deskFail("That person is not in the book.", 404);
   return personOf(row);
 }
@@ -162,7 +174,9 @@ function messageOf(row, userId) {
 
 export async function listThreads(db, userId) {
   await touch(db, userId);
-  const people = await db.all("SELECT id, name, bio, avatar_path FROM users WHERE id != ? ORDER BY name COLLATE NOCASE", [userId]);
+  const people = db.tenantId
+    ? await db.all("SELECT id, name, bio, avatar_path FROM users WHERE id != ? AND tenant_id = ? ORDER BY name COLLATE NOCASE", [userId, db.tenantId])
+    : await db.all("SELECT id, name, bio, avatar_path FROM users WHERE id != ? ORDER BY name COLLATE NOCASE", [userId]);
   const messages = await db.all(
     `SELECT id, sender_id, recipient_id, body, created_at, seen FROM messages
      WHERE sender_id = ? OR recipient_id = ? ORDER BY id DESC LIMIT 300`,
@@ -371,7 +385,9 @@ export async function deskSnapshot(db, userId) {
     open = callOf(openRow, userId, person);
   }
   const online = await activeIds(db);
-  const people = await db.all("SELECT id, name, bio, avatar_path FROM users WHERE id != ?", [userId]);
+  const people = db.tenantId
+    ? await db.all("SELECT id, name, bio, avatar_path FROM users WHERE id != ? AND tenant_id = ?", [userId, db.tenantId])
+    : await db.all("SELECT id, name, bio, avatar_path FROM users WHERE id != ?", [userId]);
   return {
     unread: Number(unreadRow?.total || 0),
     incoming,
@@ -391,11 +407,20 @@ async function firstHits(terms, run) {
 async function recipeHits(db, term) {
   const needle = likeTerm(term);
   if (needle === "%%") return [];
+  if (!db.tenantId) {
+    return db.all(
+      `SELECT id, title, summary, cuisine, category FROM recipes
+       WHERE title LIKE ? OR summary LIKE ? OR ingredients LIKE ? OR notes LIKE ? OR steps LIKE ?
+       ORDER BY title COLLATE NOCASE LIMIT 8`,
+      [needle, needle, needle, needle, needle]
+    );
+  }
   return db.all(
     `SELECT id, title, summary, cuisine, category FROM recipes
-     WHERE title LIKE ? OR summary LIKE ? OR ingredients LIKE ? OR notes LIKE ? OR steps LIKE ?
+     WHERE (title LIKE ? OR summary LIKE ? OR ingredients LIKE ? OR notes LIKE ? OR steps LIKE ?)
+       AND (tenant_id = '' OR tenant_id = ?)
      ORDER BY title COLLATE NOCASE LIMIT 8`,
-    [needle, needle, needle, needle, needle]
+    [needle, needle, needle, needle, needle, db.tenantId]
   );
 }
 

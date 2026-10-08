@@ -1,3 +1,5 @@
+import { services } from "../../shared/brand-config.js";
+
 function fail(message, status) {
   const error = new Error(message);
   error.status = status;
@@ -65,7 +67,7 @@ export async function browse(raw) {
     response = await fetch(current, {
       redirect: "manual",
       headers: {
-        "User-Agent": "LisasRecipeBook/1.0 (personal cookbook reader)",
+        "User-Agent": services.userAgent,
         Accept: "text/html,application/xhtml+xml"
       }
     });
